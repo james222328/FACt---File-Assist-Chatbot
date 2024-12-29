@@ -1,5 +1,7 @@
 # FACT - File Assist ChatboT
 
+The FACT file in this repository is a python notebook copy of this Project.
+
 ## Overview
 FACT (File Assist ChatboT) is a Streamlit-based application that allows users to:
 - Upload and process PDF, DOCX, and PPTX files.
@@ -7,10 +9,6 @@ FACT (File Assist ChatboT) is a Streamlit-based application that allows users to
 - Generate text embeddings and store them in a FAISS vector store for similarity searches.
 - Use AI-powered conversational features to answer questions based on uploaded documents or scraped web content.
 - Interact with web-scraped content and AI-generated prompts.
-
-
-The FACT file in this repository is a copy of the python notebook of this Project.
-
 
 ## Features
 1. **File Processing**:  
