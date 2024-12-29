@@ -1,0 +1,540 @@
+!pip install streamlit
+
+!pip install streamlit google-cloud-aiplatform PyPDF2 streamlit-extras pytesseract pdf2image python-docx python-pptx -q
+!pip install google-generativeai langchain langchain_google_genai faiss-cpu python-dotenv streamlit-extras transformers torch torchvision -q
+!pip install -U langchain-community -q
+
+!apt-get install -y poppler-utils tesseract-ocr -q
+!pip install PyMuPDF -q
+
+# Install localtunnel and run the app
+!npm install localtunnel
+
+import sqlite3
+
+def create_db():
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+create_db()
+
+import sqlite3
+
+def view_database():
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+
+    # View tables
+    c.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = c.fetchall()
+    print("Tables:", tables)
+
+    # View data in 'users' table
+    c.execute('SELECT * FROM users')
+    rows = c.fetchall()
+    for row in rows:
+        print(row)
+
+    conn.close()
+
+if __name__ == "__main__":
+    view_database()
+
+
+
+!wget -q -O - ipv4.icanhazip.com
+
+!streamlit run app.py & npx localtunnel --port 8501
+
+
+
+
+
+%%writefile app.py
+
+import os
+import streamlit as st
+import sqlite3
+from PyPDF2 import PdfReader
+from pdf2image import convert_from_path
+import fitz  # PyMuPDF
+import pytesseract
+from PIL import Image
+from io import BytesIO
+from docx import Document
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+import google.generativeai as genai
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.chains.question_answering import load_qa_chain
+from langchain.prompts import PromptTemplate
+from dotenv import load_dotenv
+import hashlib
+import requests
+from bs4 import BeautifulSoup
+from langchain.schema import AIMessage, HumanMessage, SystemMessage
+
+
+# Load environment variables
+load_dotenv()
+
+# Set API key
+os.environ["GOOGLE_API_KEY"] = "YOUR_API_KEY"
+api_key = os.getenv("GOOGLE_API_KEY")
+genai.configure(api_key=api_key)
+
+# Function Definitions
+
+# Database functions
+def create_user(username, password):
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    hashed_password = hashlib.sha256(password.encode()).hexdigest()
+    try:
+        c.execute('INSERT INTO users (username, password) VALUES (?, ?)', (username, hashed_password))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        return False
+    conn.close()
+    return True
+
+def authenticate_user(username, password):
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    hashed_password = hashlib.sha256(password.encode()).hexdigest()
+    c.execute('SELECT * FROM users WHERE username = ? AND password = ?', (username, hashed_password))
+    user = c.fetchone()
+    conn.close()
+    return user
+
+def delete_user(username, password):
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    hashed_password = hashlib.sha256(password.encode()).hexdigest()
+    c.execute('DELETE FROM users WHERE username = ? AND password = ?', (username, hashed_password))
+    conn.commit()
+    conn.close()
+
+def describe_image(image):
+    return pytesseract.image_to_string(image)
+
+def get_pdf_text(pdf_docs):
+    text = ""
+    images_descriptions = []
+    for pdf in pdf_docs:
+        with open(pdf.name, "wb") as f:
+            f.write(pdf.getbuffer())
+
+        pdf_reader = PdfReader(pdf.name)
+        for page_num, page in enumerate(pdf_reader.pages):
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text
+            else:
+                images = convert_from_path(pdf.name, first_page=page_num + 1, last_page=page_num + 1)
+                for image in images:
+                    page_text += pytesseract.image_to_string(image)
+
+                if page_text.strip():
+                    text += page_text
+                else:
+                    st.write(f"No text extracted from page {page_num + 1}.")
+
+        pdf_document = fitz.open(pdf.name)
+        for page_num in range(len(pdf_document)):
+            page = pdf_document.load_page(page_num)
+            for img_index, img in enumerate(page.get_images(full=True)):
+                xref = img[0]
+                base_image = pdf_document.extract_image(xref)
+                image_bytes = base_image["image"]
+                image = Image.open(BytesIO(image_bytes))
+                ocr_text = describe_image(image)
+                if ocr_text.strip():
+                    text += ocr_text
+                    images_descriptions.append(ocr_text)
+                else:
+                    st.write(f"No text extracted from image on page {page_num + 1}.")
+
+        os.remove(pdf.name)
+    return text, images_descriptions
+
+def get_docx_text(docx_docs):
+    text = ""
+    images_descriptions = []
+    for docx in docx_docs:
+        document = Document(docx)
+        for paragraph in document.paragraphs:
+            text += paragraph.text
+
+        for rel in document.part.rels:
+            if "image" in document.part.rels[rel].target_ref:
+                image = document.part.rels[rel].target_part.blob
+                images_descriptions.append(describe_image(Image.open(BytesIO(image))))
+    return text, images_descriptions
+
+def get_pptx_text(pptx_docs):
+    text = ""
+    images_descriptions = []
+    slide_count = 0
+    slide_texts = []
+    for pptx in pptx_docs:
+        presentation = Presentation(pptx)
+        slide_count += len(presentation.slides)
+        for slide_num, slide in enumerate(presentation.slides):
+            slide_text = f"Slide {slide_num + 1}:\n"
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for paragraph in shape.text_frame.paragraphs:
+                        slide_text += paragraph.text + "\n"
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    image = shape.image.blob
+                    images_descriptions.append(describe_image(Image.open(BytesIO(image))))
+            slide_texts.append(slide_text.strip())
+            text += slide_text
+    return text, images_descriptions, slide_count, slide_texts
+
+
+def generate_related_prompts(text):
+    model = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.8)
+
+    # Create a list of BaseMessages, expected by the model
+    messages = [
+        SystemMessage(content="You are an assistant helping to generate short related questions."),
+        HumanMessage(content=f"Suggest 5 to 7 short questions related to the following content: {text}")
+    ]
+
+    # Use invoke with the properly formatted messages
+    response = model.invoke(messages)
+
+    # Access the 'content' attribute of the response (which is an AIMessage object)
+    generated_text = response.content
+
+    # Extracting and splitting the output into prompts
+    prompts = generated_text.split("\n")
+    return [prompt.strip() for prompt in prompts if prompt.strip()]
+
+
+def get_text_chunks(text):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
+    chunks = text_splitter.split_text(text)
+    return chunks
+
+def get_vector_store(text_chunks):
+    if not text_chunks:
+        raise ValueError("Text chunks are empty. Cannot create FAISS index.")
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+
+    # Ensure text_chunks is a string
+    if isinstance(text_chunks, list):
+        text = " ".join(text_chunks)
+    else:
+        text = text_chunks
+
+    chunks = splitter.split_text(text)
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+    vectors = embeddings.embed_documents(chunks)  # Use chunks here
+
+    if not vectors:
+        raise ValueError("No vectors created from text chunks.")
+
+    vector_store = FAISS.from_texts(chunks, embedding=embeddings)  # Use chunks here
+    vector_store.save_local("faiss_index")
+    return vector_store
+
+
+def update_vector_store(text_chunks):
+    # Load existing FAISS index or create new one
+    if os.path.exists("faiss_index"):
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+        existing_index = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+        new_index = existing_index
+    else:
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+        new_index = FAISS.from_texts([], embedding=embeddings)
+
+    # Add new chunks to the index
+    vectors = embeddings.embed_documents(text_chunks)
+    for chunk, vector in zip(text_chunks, vectors):
+        new_index.add_texts([chunk], metadatas=[{}], vectors=[vector])
+    new_index.save_local("faiss_index")
+
+def get_conversational_chain():
+    prompt_template = """
+    Answer the question as detailed as possible from the provided context. If the answer is not in
+    the provided context, just say, "answer is not available in the context", don't provide a wrong answer.
+
+    Context:\n{context}\n
+    Question:\n{question}\n
+
+    Answer:
+    """
+    model = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.8)
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
+    return chain
+
+def user_input(user_question, text, images_descriptions, slide_count, slide_texts):
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+    new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+
+    # Check if the user question is related to web content
+    if "url" in user_question.lower() or "website" in user_question.lower():
+        if st.session_state.web_text:
+            # Use web content if available
+            text = st.session_state.web_text
+            update_vector_store(get_text_chunks(text))  # Update FAISS index with web content
+
+    # Perform similarity search
+    docs = new_db.similarity_search(user_question)
+
+    # Ensure we have a valid response
+    if not docs:
+        return "answer is not available in the context."
+
+    chain = get_conversational_chain()
+    response = chain.invoke({"input_documents": docs, "question": user_question})
+
+    answer = response["output_text"]
+
+    # Handle specific questions related to images or slides
+    if "image" in user_question.lower() or "picture" in user_question.lower():
+        if "describe" in user_question.lower():
+            if images_descriptions:
+                answer += "\n\nImages Descriptions:\n"
+                answer += "\n".join(images_descriptions)
+        else:
+            answer = f"There are {len(images_descriptions)} images in the file."
+
+    if "slide" in user_question.lower() or "ppt" in user_question.lower():
+        if "third slide" in user_question.lower():
+            slide_number = 3
+        else:
+            slide_number = [int(s) for s in user_question.split() if s.isdigit()]
+            slide_number = slide_number[0] if slide_number else None
+
+        if slide_number and slide_number <= slide_count:
+            answer = f"The PPTX file contains {slide_count} slides."
+            if "describe" in user_question.lower():
+                answer += f"\n\nContents of Slide {slide_number}:\n"
+                answer += slide_texts[slide_number - 1]
+        else:
+            answer = "Invalid slide number or slide not found."
+
+    return answer
+
+
+def scrape_web_content(url):
+    response = requests.get(url)
+    if response.status_code == 200:
+        soup = BeautifulSoup(response.content, 'html.parser')
+        text = soup.get_text()
+        return text
+    else:
+        return "Failed to retrieve content from the URL."
+
+# Main Application
+
+def main():
+    st.title("FACT - File Assist ChatboT")
+
+    if 'logged_in' not in st.session_state:
+        st.session_state.logged_in = False
+
+    if not st.session_state.logged_in:
+        st.sidebar.title("Authentication")
+        option = st.sidebar.selectbox("Select an option", ["Signup", "Login", "Delete Account"])
+
+        if option == "Signup":
+            st.subheader("Signup")
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            if st.button("Signup"):
+                if create_user(username, password):
+                    st.success("Account created successfully!")
+                else:
+                    st.error("Username already exists.")
+
+        elif option == "Login":
+            st.subheader("Login")
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            if st.button("Login"):
+                if authenticate_user(username, password):
+                    st.session_state.logged_in = True
+                    st.session_state.username = username
+                    st.success("Logged in successfully!")
+                else:
+                    st.error("Invalid credentials.")
+
+        elif option == "Delete Account":
+            st.subheader("Delete Account")
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            if st.button("Delete Account"):
+                delete_user(username, password)
+                st.success("Account deleted successfully!")
+
+    else:
+        # Initialize session state variables if not already done
+        if 'raw_text' not in st.session_state:
+            st.session_state.raw_text = ""
+        if 'images_descriptions' not in st.session_state:
+            st.session_state.images_descriptions = []
+        if 'slide_count' not in st.session_state:
+            st.session_state.slide_count = 0
+        if 'slide_texts' not in st.session_state:
+            st.session_state.slide_texts = []
+        if 'chat_history' not in st.session_state:
+            st.session_state.chat_history = []
+        if 'web_text' not in st.session_state:
+            st.session_state.web_text = ""
+        if 'suggested_prompts' not in st.session_state:
+            st.session_state.suggested_prompts = []
+        if 'selected_prompt' not in st.session_state:
+            st.session_state.selected_prompt = ""
+
+        # Display chat history
+        for message in st.session_state.chat_history:
+            st.chat_message(message["role"]).markdown(message["content"])
+
+        # Sidebar for file uploading and processing
+        with st.sidebar:
+            st.sidebar.title(f"Welcome, {st.session_state.username}!")
+
+            # Logout button to go back to Login/Signup
+            if st.button("Logout"):
+                st.session_state.logged_in = False
+                st.session_state.username = ""
+                st.session_state.clear()  # Clear the session state
+                # Refresh the page to reflect changes
+
+            st.title("File Upload and Processing")
+            uploaded_files = st.file_uploader("Upload your PDF, DOCX, or PPTX Files", accept_multiple_files=True)
+            selected_file = st.selectbox("Select a file to process", uploaded_files, format_func=lambda x: x.name if x else "None")
+
+            if st.button("Submit & Process"):
+                if selected_file:
+                    with st.spinner("Processing..."):
+                        raw_text = ""
+                        images_descriptions = []
+                        slide_count = 0
+                        slide_texts = []
+
+                        # Process only the selected file
+                        if selected_file.name.endswith(".pdf"):
+                            text, pdf_images_descriptions = get_pdf_text([selected_file])
+                            raw_text += text
+                            images_descriptions.extend(pdf_images_descriptions)
+                        elif selected_file.name.endswith(".docx"):
+                            text, docx_images_descriptions = get_docx_text([selected_file])
+                            raw_text += text
+                            images_descriptions.extend(docx_images_descriptions)
+                        elif selected_file.name.endswith(".pptx"):
+                            text, pptx_images_descriptions, pptx_slide_count, pptx_slide_texts = get_pptx_text([selected_file])
+                            raw_text += text
+                            images_descriptions.extend(pptx_images_descriptions)
+                            slide_count = pptx_slide_count
+                            slide_texts = pptx_slide_texts
+
+                        text_chunks = get_text_chunks(raw_text)
+
+                        if text_chunks:
+                            get_vector_store(text_chunks)
+                        else:
+                            st.error("No text chunks found. Cannot create FAISS index.")
+
+                        st.session_state.raw_text = raw_text
+                        st.session_state.images_descriptions = images_descriptions
+                        st.session_state.slide_count = slide_count
+                        st.session_state.slide_texts = slide_texts
+
+                        # Automatically generate related prompts after processing
+                        st.session_state.suggested_prompts = generate_related_prompts(raw_text)
+
+                        st.success("Done")
+                else:
+                    st.error("Please select a file to process.")
+
+            # URL scraping
+            st.title("Web URL Scraping")
+            url = st.text_input("Enter a URL to scrape")
+            if st.button("Scrape URL"):
+                if url:
+                    with st.spinner("Scraping URL..."):
+                        try:
+                            web_text = scrape_web_content(url)
+                            st.session_state.web_text = web_text
+                            update_vector_store(get_text_chunks(web_text))  # Update FAISS index with web content
+
+                            # Automatically generate related prompts for the scraped content
+                            st.session_state.suggested_prompts = generate_related_prompts(web_text)
+
+                            st.success("URL scraped successfully!")
+                        except Exception as e:
+                            st.error(f"An error occurred: {e}")
+                else:
+                    st.error("Please enter a URL.")
+
+        # Add layout at the bottom of the page
+        col1, col2 = st.columns([6, 5])  # Create two columns for layout at the bottom
+
+        with col1:
+            # Chat input box
+            user_prompt = st.chat_input("Ask FACboT...")
+
+        with col2:
+            # Dropdown for suggested prompts
+            if st.session_state.suggested_prompts:
+                # Update the default value using a callback function
+                def update_selected_prompt():
+                    st.session_state.selected_prompt = st.session_state.prompt_selection
+
+                # Add a selectbox widget with a key for the session state value
+                st.selectbox(
+                    "Suggested Questions:",
+                    st.session_state.suggested_prompts[1:],
+                    key="prompt_selection",  # Using a separate key to avoid direct assignment error
+                    on_change=update_selected_prompt  # Callback to update the selected prompt in session state
+                )
+
+
+        # Determine which input to use (user's custom input or the selected suggested prompt)
+        final_prompt = user_prompt if user_prompt else st.session_state.selected_prompt
+
+        if final_prompt:
+            # Add user message (either custom input or selected prompt) to chat history
+            st.session_state.chat_history.append({"role": "user", "content": final_prompt})
+
+            # Process the user input
+            if st.session_state.web_text:
+                text = st.session_state.web_text
+                update_vector_store(get_text_chunks(text))  # Update FAISS index with web content
+            else:
+                text = st.session_state.raw_text
+
+            response_text = user_input(final_prompt, text, st.session_state.images_descriptions, st.session_state.slide_count, st.session_state.slide_texts)
+
+            # Add assistant message to chat history
+            st.session_state.chat_history.append({"role": "assistant", "content": response_text})
+
+            # Display the new messages
+            st.chat_message("user").markdown(final_prompt)
+            st.chat_message("assistant").markdown(response_text)
+
+
+
+if __name__ == "__main__":
+    main()
