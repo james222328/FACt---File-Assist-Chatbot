@@ -36,36 +36,29 @@ FACT (File Assist ChatboT) is a Streamlit-based application that allows users to
 - Tesseract-OCR and Poppler-utils for OCR and PDF processing
 
 ### Setup Instructions
-
-1. Clone the Repository:
-   ```bash
-   git clone <repository-url>
-   cd <repository-folder>
-   ```
-
-2. Install Python Dependencies:
+1. Install Python Dependencies:
    ```bash
    pip install -r requirements.txt
    ```
 
-3. Install Local Dependencies:
+2. Install Local Dependencies:
    ```bash
    npm install localtunnel
    ```
 
-4. Set Up Environment Variables:
+3. Set Up Environment Variables:
    - Create a `.env` file in the root directory.
    - Add the following environment variable:
      ```
      GOOGLE_API_KEY=<your-google-api-key>
      ```
 
-5. Install System Utilities:
+4. Install System Utilities:
    ```bash
    apt-get install -y poppler-utils tesseract-ocr
    ```
 
-6. Initialize the Database:
+5. Initialize the Database:
    ```python
    python -c "import app; app.create_db()"
    ```
