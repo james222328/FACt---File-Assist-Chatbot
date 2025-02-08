@@ -1,7 +1,7 @@
 # FACT - File Assist ChatboT
 
-The Frontend code is the landing page coded in Next.js
-The FACT file in this repository is a python notebook copy of this Project.
+- The Frontend code is the landing page coded in Next.js . 
+- The FACT file in this repository is a python notebook copy of this Project.
 
 ## Overview
 FACT (File Assist ChatboT) is a Streamlit-based application that allows users to:
